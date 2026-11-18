@@ -35,11 +35,13 @@ class UnfollowService : AccessibilityService() {
         const val IG = "com.instagram.android"
 
         // Do unfollow ke beech technical minimum (popup band hone ka time), isse kam nahi ho sakta
-        private const val SETTLE_MS = 500L
-        private const val POLL_MS = 150L
-        private const val MAX_POLLS = 25
+        private const val SETTLE_MS = 150L
+        private const val POLL_MS = 50L
+        private const val MAX_POLLS = 70
+        // Unfollow click ke baad dusra confirm popup aaya ya nahi, ye dekhne ka wait
+        private const val CONFIRM_WAIT_MS = 300L
         // Ek unfollow ka lagbhag fixed overhead (tap + popup), sirf speed estimate ke liye
-        private const val OVERHEAD_SEC = 1.2f
+        private const val OVERHEAD_SEC = 0.7f
 
         private const val FLAGS_IDLE =
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
@@ -55,6 +57,8 @@ class UnfollowService : AccessibilityService() {
     private var tapStreak = 0
     private var navTaps = 0
     private var awaitingConfirm = false
+    private var countedThisRow = false
+    private var pendingGap = false
     private var confirmTries = 0
     private var startedAt = 0L
     private var minDelayMs = 3_000L
@@ -292,6 +296,8 @@ class UnfollowService : AccessibilityService() {
         tapStreak = 0
         navTaps = 0
         awaitingConfirm = false
+        countedThisRow = false
+        pendingGap = false
         confirmTries = 0
         startedAt = SystemClock.elapsedRealtime()
         running = true
@@ -330,11 +336,6 @@ class UnfollowService : AccessibilityService() {
     private fun step() {
         if (!running) return
 
-        if (done >= target) {
-            stop("Ho gaya! $done unfollow.${liveRate()}")
-            return
-        }
-
         val root = rootInActiveWindow
         if (root == null || root.packageName?.toString() != IG) {
             wrongAppRounds++
@@ -355,24 +356,37 @@ class UnfollowService : AccessibilityService() {
         val w = resources.displayMetrics.widthPixels
         val h = resources.displayMetrics.heightPixels
 
-        // 1) Confirm popup: "Unfollow"
+        // 1) "Unfollow" (⋮ menu ka laal option ya "Unfollow user?" dialog, dono)
         val confirm = findNode(root) { label, _ -> label.equals("Unfollow", ignoreCase = true) }
-        if (confirm != null) {
+        if (confirm != null && !(done >= target && !countedThisRow)) {
             confirm.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            done++
+            if (!countedThisRow) {
+                done++
+                countedThisRow = true
+                pendingGap = true
+            }
             awaitingConfirm = false
             tapStreak = 0
             emptyRounds = 0
             report("Unfollow $done / $target${liveRate()}")
-            if (done >= target) {
-                later(SETTLE_MS)
-                return
-            }
-            later(nextGapMs())
+            // Dusra confirm dialog aa sakta hai, pehle wahi check karo
+            later(CONFIRM_WAIT_MS)
             return
         }
 
-        // 1b) "Following" tap ho chuka hai, popup aane ka wait (poll)
+        if (done >= target) {
+            stop("Ho gaya! $done unfollow.${liveRate()}")
+            return
+        }
+
+        // Dusra dialog nahi aaya: ab user ka diya gap (jitna bacha hai) ruko
+        if (pendingGap) {
+            pendingGap = false
+            later(max(nextGapMs() - CONFIRM_WAIT_MS, 0L))
+            return
+        }
+
+        // 1b) Menu tap ho chuka hai, "Unfollow" aane ka wait (poll)
         if (awaitingConfirm) {
             confirmTries++
             if (confirmTries <= MAX_POLLS) {
@@ -382,20 +396,20 @@ class UnfollowService : AccessibilityService() {
             awaitingConfirm = false
             tapStreak++
             if (tapStreak > 3) {
-                stop("Unfollow popup nahi aaya (Instagram UI badla hoga). Done: $done")
+                stop("Unfollow option nahi mila. Screen pe: ${labelsOnScreen(root)}. Done: $done")
                 return
             }
-            later(SETTLE_MS)
+            performGlobalAction(GLOBAL_ACTION_BACK) // khula sheet band karo
+            later(SETTLE_MS + 500)
             return
         }
 
-        // 2) Row ka "Following" button (header/tabs ko skip karta hai)
-        val rowBtn = findNode(root) { label, r ->
-            label.equals("Following", ignoreCase = true) && r.top > h * 0.2 && r.left > w * 0.5
-        }
+        // 2) Sabse upar wali row: "Following" button (private) ya "Message" ke saath ⋮ (public)
+        val rowBtn = findNextRow(root, w, h)
         if (rowBtn != null) {
             emptyRounds = 0
             navTaps = 0
+            countedThisRow = false
             rowBtn.performAction(AccessibilityNodeInfo.ACTION_CLICK)
             awaitingConfirm = true
             confirmTries = 0
@@ -422,12 +436,61 @@ class UnfollowService : AccessibilityService() {
 
         // 4) Kuch nahi dikha to scroll
         emptyRounds++
-        if (emptyRounds >= 4) {
+        if (emptyRounds >= 8) {
             stop("Aur buttons nahi mile (list khatam?). Done: $done")
             return
         }
         findScrollable(root)?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
-        later(2000)
+        later(if (emptyRounds <= 1) 450 else 900)
+    }
+
+
+    private fun collect(node: AccessibilityNodeInfo?, out: MutableList<AccessibilityNodeInfo>) {
+        if (node == null) return
+        out.add(node)
+        for (i in 0 until node.childCount) collect(node.getChild(i), out)
+    }
+
+    private fun labelOf(n: AccessibilityNodeInfo): String? =
+        (n.text ?: n.contentDescription)?.toString()?.trim()
+
+    /**
+     * Screen par jo bhi unfollow-able rows dikh rahi hain unme se sabse upar wali ka button deta hai:
+     *  - "Following" button (private accounts), ya
+     *  - "Message" button ke right wala ⋮ (public accounts).
+     * Jo rows pehle hi unfollow ho chuki ("Follow" button) wo skip hoti hain.
+     */
+    private fun findNextRow(root: AccessibilityNodeInfo, w: Int, h: Int): AccessibilityNodeInfo? {
+        val all = ArrayList<AccessibilityNodeInfo>()
+        collect(root, all)
+        val boxes = all.map { n -> Pair(n, Rect().also { n.getBoundsInScreen(it) }) }
+        var best: AccessibilityNodeInfo? = null
+        var bestTop = Int.MAX_VALUE
+
+        for ((n, r) in boxes) {
+            if (r.width() <= 0 || r.top <= h * 0.2 || r.bottom >= h * 0.95 || r.left <= w * 0.4) continue
+            val label = labelOf(n) ?: continue
+            if (label.equals("Following", ignoreCase = true)) {
+                val btn = clickableAncestor(n) ?: continue
+                if (r.top < bestTop) { best = btn; bestTop = r.top }
+            } else if (label.equals("Message", ignoreCase = true)) {
+                val menu = boxes
+                    .filter { (m, mr) ->
+                        m.isClickable && m.isVisibleToUser &&
+                            mr.left >= r.right - 4 && mr.centerY() in r.top..r.bottom && mr.width() < w * 0.25
+                    }
+                    .minByOrNull { it.second.left }
+                if (menu != null && r.top < bestTop) { best = menu.first; bestTop = r.top }
+            }
+        }
+        return best
+    }
+
+    private fun labelsOnScreen(root: AccessibilityNodeInfo): String {
+        val all = ArrayList<AccessibilityNodeInfo>()
+        collect(root, all)
+        return all.mapNotNull { labelOf(it) }.filter { it.isNotEmpty() && it.length < 25 }
+            .distinct().take(15).joinToString(" | ")
     }
 
     private fun isBlocked(root: AccessibilityNodeInfo): Boolean {
@@ -463,12 +526,10 @@ class UnfollowService : AccessibilityService() {
     }
 
     private fun findScrollable(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
-        if (node == null) return null
-        if (node.isScrollable) return node
-        for (i in 0 until node.childCount) {
-            val found = findScrollable(node.getChild(i))
-            if (found != null) return found
+        val all = ArrayList<AccessibilityNodeInfo>()
+        collect(node, all)
+        return all.filter { it.isScrollable }.maxByOrNull {
+            val r = Rect(); it.getBoundsInScreen(r); r.width().toLong() * r.height()
         }
-        return null
     }
 }
